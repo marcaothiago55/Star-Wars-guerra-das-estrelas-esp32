@@ -1,0 +1,735 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <FastLED.h>
+#include <Preferences.h> 
+
+// ================= CONFIGURAÇÕES =================
+#define LED_PIN     13    
+#define BUZZER_PIN  4     
+#define NUM_LEDS    50    
+#define GAME_LEDS   50    
+#define LIVES_LEDS  5     
+#define BRIGHTNESS  50    
+#define LED_TYPE    WS2812B
+#define COLOR_ORDER GRB
+
+const char* ssid = "Star Wars Guerra nas Estrelas";
+const char* password = "12345678";
+
+// ================= OBJETOS =================
+CRGB leds[NUM_LEDS];       
+CRGB enemies[NUM_LEDS];
+int enemyHP[NUM_LEDS]; 
+Preferences preferences; 
+WebServer server(80);
+
+// ================= ESTRUTURAS DO JOGO =================
+struct Bullet {
+  bool active;
+  int position;
+  CRGB color;
+  bool isSpecial; 
+};
+Bullet bullets[20]; 
+
+bool gameRunning = false;
+bool playIntroRequest = false;
+unsigned long lastGameLoop = 0;
+int gameSpeed = 30; 
+
+String currentPlayerName = "Jedi";
+int currentLives = 5;
+int score = 0;
+int enemyMoveCounter = 0;
+
+// === VARIAVEIS DE CONTROLE ===
+int killCounter = 0;       
+int totalKills = 0;        
+int level = 1;             
+bool bossSpawnPending = false; 
+
+// === DIFICULDADE ===
+// 0 = Facil (Padawan), 1 = Medio (Jedi), 2 = Dificil (Mestre)
+int gameDifficulty = 1; 
+
+int enemySpeedDelay = 10; 
+int spawnRate = 30;       
+
+// Recordes (Arrays para os 3 niveis)
+int highScores[3] = {0, 0, 0}; 
+String highScoreNames[3] = {"Ninguem", "Ninguem", "Ninguem"};
+
+bool isExploding = false;
+
+// ================= SISTEMA DE SOM =================
+#define NOTE_B4  494
+#define NOTE_AS4 466
+#define NOTE_A4  440
+#define NOTE_GS4 415
+#define NOTE_G4  392
+#define NOTE_F4  349
+#define NOTE_A5  880
+#define NOTE_GS5 831
+#define NOTE_G5  784
+#define NOTE_FS5 740
+#define NOTE_F5  698
+#define NOTE_E5  659
+#define NOTE_DS5 622
+#define NOTE_D5  587
+#define NOTE_CS5 554
+#define NOTE_C5  523
+
+void playImperialMarch() {
+  int melody[] = {
+    NOTE_A4, NOTE_A4, NOTE_A4, NOTE_F4, NOTE_C5, NOTE_A4, NOTE_F4, NOTE_C5, NOTE_A4,
+    NOTE_E5, NOTE_E5, NOTE_E5, NOTE_F5, NOTE_C5, NOTE_GS4, NOTE_F4, NOTE_C5, NOTE_A4,
+    NOTE_A5, NOTE_A4, NOTE_A4, NOTE_A5, NOTE_GS5, NOTE_G5, NOTE_FS5, NOTE_F5, NOTE_FS5,
+    0, NOTE_AS4, NOTE_DS5, NOTE_D5, NOTE_CS5, NOTE_C5, NOTE_B4, NOTE_C5,
+    0, NOTE_F4, NOTE_GS4, NOTE_F4, NOTE_A4, NOTE_C5, NOTE_A4, NOTE_C5, NOTE_E5
+  };
+
+  int durations[] = {
+    500, 500, 500, 350, 150, 1000, 350, 150, 1000,
+    500, 500, 500, 350, 150, 1000, 350, 150, 1000,
+    500, 300, 150, 500, 325, 175, 125, 125, 250,
+    325, 250, 500, 325, 175, 125, 125, 250,
+    350, 250, 500, 350, 125, 500, 375, 125, 1000
+  };
+
+  int totalNotes = sizeof(melody) / sizeof(int);
+
+  for (int i = 0; i < totalNotes; i++) {
+    if (!gameRunning) {
+        fill_solid(leds, NUM_LEDS, CRGB::Black);
+        FastLED.show();
+        return; 
+    }
+    
+    if (melody[i] == 0) {
+      fill_solid(leds, NUM_LEDS, CRGB::Black);
+      FastLED.show();
+      delay(durations[i]);
+    } else {
+      fill_solid(leds, NUM_LEDS, CHSV(random8(), 255, 255)); 
+      FastLED.show();
+      ledcWriteTone(BUZZER_PIN, melody[i]);
+      delay(durations[i]);
+      ledcWriteTone(BUZZER_PIN, 0);
+      fill_solid(leds, NUM_LEDS, CRGB::Black);
+      FastLED.show();
+      delay(50); 
+    }
+  }
+  fill_solid(leds, NUM_LEDS, CRGB::Black);
+  FastLED.show();
+}
+
+void sfxExplosion() {
+  isExploding = true;
+  for (int k = 0; k < 5; k++) {
+    ledcWriteTone(BUZZER_PIN, random(50, 200)); delay(10);
+  }
+  ledcWriteTone(BUZZER_PIN, 0);
+  isExploding = false;
+}
+
+void sfxLifeLost() {
+  ledcWriteTone(BUZZER_PIN, 150); delay(200); ledcWriteTone(BUZZER_PIN, 0);
+}
+
+void sfxSpecialFire() { 
+  for (int i = 500; i < 2000; i+=100) { ledcWriteTone(BUZZER_PIN, i); delay(10); }
+  ledcWriteTone(BUZZER_PIN, 0);
+}
+
+void sfxGameOver() {
+  int notes[] = {600, 500, 400, 300};
+  int dur[] = {300, 300, 300, 800};
+  for (int i = 0; i < 4; i++) {
+    ledcWriteTone(BUZZER_PIN, notes[i]); delay(dur[i]);
+  }
+  ledcWriteTone(BUZZER_PIN, 0);
+}
+
+void sfxLevelUp() {
+  ledcWriteTone(BUZZER_PIN, 1000); delay(100); 
+  ledcWriteTone(BUZZER_PIN, 1500); delay(100); 
+  ledcWriteTone(BUZZER_PIN, 0);
+}
+
+void updateMissileSound() {
+  if (isExploding) return;
+  int leadingBulletPos = -1;
+  for(int i=0; i<20; i++) {
+    if (bullets[i].active && bullets[i].position > leadingBulletPos) leadingBulletPos = bullets[i].position;
+  }
+  if (leadingBulletPos != -1) {
+    int freq = map(leadingBulletPos, 0, GAME_LEDS, 2500, 500);
+    ledcWriteTone(BUZZER_PIN, freq);
+  } else {
+    ledcWriteTone(BUZZER_PIN, 0);
+  }
+}
+
+// ================= LÓGICA DO JOGO =================
+
+void checkHighScore() {
+  // Salva no slot da dificuldade atual
+  if (score > highScores[gameDifficulty]) {
+    highScores[gameDifficulty] = score;
+    highScoreNames[gameDifficulty] = currentPlayerName;
+    
+    preferences.begin("guardian", false); 
+    // Chaves diferentes para cada nivel: hs_score_0, hs_score_1, etc
+    String keyScore = "hs_score_" + String(gameDifficulty);
+    String keyName = "hs_name_" + String(gameDifficulty);
+    
+    preferences.putInt(keyScore.c_str(), score);
+    preferences.putString(keyName.c_str(), currentPlayerName);
+    preferences.end();
+  }
+}
+
+void gameOver() {
+  checkHighScore(); 
+  gameRunning = false;
+  ledcWriteTone(BUZZER_PIN, 0);
+  sfxGameOver();
+  for(int k=0; k<4; k++){
+    fill_solid(leds, GAME_LEDS, CRGB::Red); FastLED.show(); delay(200);
+    fill_solid(leds, GAME_LEDS, CRGB::Black); FastLED.show(); delay(200);
+  }
+}
+
+void spawnBullet(CRGB color, bool special) {
+  for (int i = 0; i < 20; i++) {
+    if (!bullets[i].active) {
+      bullets[i].active = true;
+      bullets[i].position = LIVES_LEDS + 1;
+      bullets[i].color = color;
+      bullets[i].isSpecial = special; 
+      break;
+    }
+  }
+}
+
+void resetGame(int diff) {
+  gameRunning = false;
+  score = 0;
+  killCounter = 0;
+  totalKills = 0;
+  level = 1;
+  currentLives = 5;
+  bossSpawnPending = false;
+  gameDifficulty = diff;
+  
+  // === LOGICA DE DIFICULDADE INICIAL ===
+  if (gameDifficulty == 0) { 
+      // FACIL (PADAWAN)
+      enemySpeedDelay = 18; // Bem lento
+      spawnRate = 20;       // Poucos inimigos
+  } else if (gameDifficulty == 1) {
+      // MEDIO (JEDI)
+      enemySpeedDelay = 10; // Normal
+      spawnRate = 30;
+  } else {
+      // DIFICIL (MESTRE)
+      enemySpeedDelay = 5;  // Ja comeca frenetico
+      spawnRate = 50;       // Muitos inimigos
+  }
+  
+  fill_solid(leds, NUM_LEDS, CRGB::Black);
+  fill_solid(enemies, NUM_LEDS, CRGB::Black);
+  for(int i=0; i<NUM_LEDS; i++) enemyHP[i] = 0; 
+  for(int i=0; i<20; i++) bullets[i].active = false;
+  FastLED.show();
+}
+
+void checkLevelUp() {
+  if (totalKills > 0 && totalKills % 5 == 0) {
+      level++;
+      sfxLevelUp();
+
+      // === LOGICA DE PROGRESSAO POR DIFICULDADE ===
+      if (gameDifficulty == 0) {
+          // FACIL: Acelera muito pouco
+          if (level % 2 == 0 && enemySpeedDelay > 8) enemySpeedDelay -= 1;
+          if (spawnRate < 60) spawnRate += 2;
+      } 
+      else if (gameDifficulty == 1) {
+          // MEDIO: Acelera normal mas "demorado" (a cada 10 kills ja reduz)
+          // Codigo antigo reduzia sempre. Vamos reduzir a cada 2 niveis (10 kills)
+          if (level % 2 == 0 && enemySpeedDelay > 3) enemySpeedDelay -= 1;
+          if (spawnRate < 90) spawnRate += 5;
+      }
+      else {
+          // DIFICIL: Acelera sempre
+          if (enemySpeedDelay > 1) enemySpeedDelay -= 1;
+          if (spawnRate < 98) spawnRate += 5;
+      }
+  }
+
+  // Boss a cada 15 kills
+  if (totalKills > 0 && totalKills % 15 == 0) {
+      bossSpawnPending = true;
+  }
+}
+
+void spawnEnemy() {
+  if (bossSpawnPending) {
+      int spawnPos = GAME_LEDS - 1; 
+      enemies[spawnPos] = CRGB::Purple; 
+      enemyHP[spawnPos] = 2;            
+      bossSpawnPending = false;
+      return;
+  }
+
+  bool enemiesPresent = false;
+  for(int i = LIVES_LEDS; i < GAME_LEDS; i++) {
+      if(enemyHP[i] > 0) {
+          enemiesPresent = true;
+          break;
+      }
+  }
+
+  bool shouldSpawn = (!enemiesPresent) || (random8() < spawnRate);
+
+  if (shouldSpawn) {
+      int r = random8(0, 3);
+      int spawnPos = GAME_LEDS - 1; 
+      enemyHP[spawnPos] = 1;
+      if (r==0) enemies[spawnPos] = CRGB::Red;
+      else if (r==1) enemies[spawnPos] = CRGB::Green;
+      else enemies[spawnPos] = CRGB::Blue;
+  } else {
+      enemies[GAME_LEDS - 1] = CRGB::Black;
+      enemyHP[GAME_LEDS - 1] = 0;
+  }
+}
+
+void updateGame() {
+  // 1. Tiros
+  for (int i = 0; i < 20; i++) {
+    if (bullets[i].active) {
+      int spd = bullets[i].isSpecial ? 5 : 3; 
+      bullets[i].position += spd; 
+      if (bullets[i].position >= GAME_LEDS) bullets[i].active = false;
+    }
+  }
+
+  // 2. Inimigos
+  enemyMoveCounter++;
+  if (enemyMoveCounter >= enemySpeedDelay) {
+    for (int i = LIVES_LEDS; i < GAME_LEDS - 1; i++) {
+         enemies[i] = enemies[i+1];
+         enemyHP[i] = enemyHP[i+1]; 
+    }
+    enemies[GAME_LEDS - 1] = CRGB::Black;
+    enemyHP[GAME_LEDS - 1] = 0;
+
+    if (enemies[LIVES_LEDS].r > 0 || enemies[LIVES_LEDS].g > 0 || enemies[LIVES_LEDS].b > 0) {
+      currentLives--;
+      sfxLifeLost();
+      enemies[LIVES_LEDS] = CRGB::Black;
+      enemyHP[LIVES_LEDS] = 0;
+      if (currentLives <= 0) { gameOver(); return; }
+    }
+    spawnEnemy();
+    enemyMoveCounter = 0;
+  }
+
+  // 3. Colisão
+  for (int i = 0; i < 20; i++) {
+    if (bullets[i].active) {
+      int pos = bullets[i].position;
+      int hitbox = bullets[i].isSpecial ? 6 : 4; 
+
+      for (int k = 0; k < hitbox; k++) { 
+        if (pos + k < GAME_LEDS) {
+          if (enemies[pos+k].r > 0 || enemies[pos+k].g > 0 || enemies[pos+k].b > 0) {
+            
+            bool hit = false;
+            bool killed = false;
+            bool isBoss = (enemies[pos+k] == CRGB::Purple); 
+            
+            // ESPECIAL
+            if (bullets[i].isSpecial) {
+                for(int ex = LIVES_LEDS; ex < GAME_LEDS; ex++) {
+                    if (enemyHP[ex] > 0) {
+                         enemies[ex] = CRGB::Black;
+                         enemyHP[ex] = 0;
+                         score++; 
+                         totalKills++;
+                    }
+                }
+                fill_solid(leds, GAME_LEDS, CRGB::White);
+                FastLED.show();
+                delay(20);
+                hit = true;
+                killed = true; 
+            } 
+            // NORMAL
+            else if (enemies[pos+k] == bullets[i].color || enemies[pos+k] == CRGB::Purple) {
+               if (enemies[pos+k] == CRGB::Purple) {
+                   enemyHP[pos+k]--;
+                   if (enemyHP[pos+k] <= 0) {
+                       enemies[pos+k] = CRGB::Black;
+                       killed = true;
+                   } else {
+                       leds[pos+k] = CRGB::White; FastLED.show();
+                       bullets[i].active = false;
+                       sfxExplosion();
+                       break; 
+                   }
+               } else {
+                   enemies[pos+k] = CRGB::Black; 
+                   killed = true;
+               }
+               hit = true;
+
+            } else {
+               // --- LOGICA DE ERRO DE COR ---
+               if (gameDifficulty == 0) {
+                   // FACIL: Nao perde vida, só perde o tiro
+                   bullets[i].active = false;
+                   break;
+               } else {
+                   // MEDIO E DIFICIL: Perde vida
+                   currentLives--;
+                   sfxLifeLost();
+                   if (currentLives <= 0) { gameOver(); return; }
+                   bullets[i].active = false;
+                   break; 
+               }
+            }
+
+            if (hit && killed) {
+               if (!bullets[i].isSpecial) {
+                   score++;
+                   killCounter++; 
+                   totalKills++;  
+               } else {
+                   killCounter = 0; 
+               }
+               
+               if (isBoss && currentLives < 5) {
+                   currentLives++;
+                   ledcWriteTone(BUZZER_PIN, 2000); delay(50); ledcWriteTone(BUZZER_PIN, 0); 
+               }
+               
+               bullets[i].active = false; 
+               sfxExplosion();
+               checkLevelUp(); 
+               break; 
+            }
+          }
+        }
+      }
+    }
+  }
+
+  updateMissileSound();
+
+  // 4. Desenhar
+  fill_solid(leds, NUM_LEDS, CRGB::Black); 
+  
+  for (int i=0; i < LIVES_LEDS; i++) {
+    if (i < currentLives) leds[i] = CRGB::Green;
+    else leds[i] = CRGB::Red;
+  }
+  
+  for(int i=LIVES_LEDS; i<GAME_LEDS; i++) if (enemies[i].r>0||enemies[i].g>0||enemies[i].b>0) leds[i] = enemies[i];
+  
+  for(int i=0; i<20; i++) {
+      if (bullets[i].active && bullets[i].position < GAME_LEDS) {
+          if (bullets[i].isSpecial) {
+              leds[bullets[i].position] = CRGB::Gold;
+              if (bullets[i].position-1 > LIVES_LEDS) leds[bullets[i].position-1] = CRGB::Gold;
+              if (bullets[i].position-2 > LIVES_LEDS) leds[bullets[i].position-2] = CRGB::Gold;
+          } else {
+              leds[bullets[i].position] = bullets[i].color;
+          }
+      }
+  }
+  
+  FastLED.show();
+}
+
+// ================= HTML & CSS STAR WARS =================
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Star Wars Guerra nas Estrelas</title>
+  <style>
+    body { 
+        font-family: 'Impact', 'Arial Black', sans-serif; 
+        text-align: center; 
+        background-color: #000; 
+        color: #FFE81F; 
+        margin:0; 
+        user-select:none;
+        overflow: hidden; 
+    }
+    
+    .stars {
+        position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: -1;
+        background-image: 
+            radial-gradient(white, rgba(255,255,255,.2) 2px, transparent 3px),
+            radial-gradient(white, rgba(255,255,255,.15) 1px, transparent 2px),
+            radial-gradient(white, rgba(255,255,255,.1) 2px, transparent 3px);
+        background-size: 550px 550px, 350px 350px, 250px 250px;
+        background-position: 0 0, 40px 60px, 130px 270px;
+    }
+
+    .dashboard {
+      background: rgba(30, 30, 30, 0.9); padding: 15px 10px; 
+      border-bottom: 2px solid #FFE81F;
+      display: flex; justify-content: space-around; align-items: center; 
+      box-shadow: 0 0 15px rgba(255, 232, 31, 0.2);
+    }
+    .stat-box { display: flex; flex-direction: column; }
+    .stat-val { font-size: 20px; color: #fff; text-shadow: 0 0 5px #FFE81F; }
+    .lives { color: #ff0033; font-size: 35px; line-height: 35px; text-shadow: 0 0 15px #ff0000; }
+
+    .btn { 
+      border: 2px solid #333; padding: 25px 0; width: 90%; margin: 8px 0;
+      font-size: 22px; border-radius: 10px; cursor: pointer;
+      text-transform: uppercase; letter-spacing: 2px;
+      transition: all 0.1s; font-weight: bold;
+    }
+    .btn:active { transform: scale(0.98); }
+    
+    .btn-red { background: #000; color: #ff3333; border-color: #ff3333; box-shadow: 0 0 10px #ff3333; text-shadow: 0 0 5px #ff3333; }
+    .btn-green { background: #000; color: #33ff33; border-color: #33ff33; box-shadow: 0 0 10px #33ff33; text-shadow: 0 0 5px #33ff33; }
+    .btn-blue { background: #000; color: #3333ff; border-color: #3333ff; box-shadow: 0 0 10px #3333ff; text-shadow: 0 0 5px #3333ff; }
+    
+    #specialBtn { background: #222; color: #555; border-color: #444; cursor: not-allowed; }
+    #specialBtn.ready { 
+       background: #000; color: #FFE81F; border-color: #FFE81F; cursor: pointer;
+       box-shadow: 0 0 20px #FFE81F; animation: pulse 1s infinite;
+    }
+    @keyframes pulse { 0% {box-shadow: 0 0 10px #FFE81F;} 50% {box-shadow: 0 0 25px #FFE81F;} 100% {box-shadow: 0 0 10px #FFE81F;} }
+
+    #startScreen { height: 90vh; display: flex; flex-direction: column; justify-content: center; align-items: center; z-index: 10; position: relative; }
+    
+    h1 { font-size: 32px; letter-spacing: 3px; margin-bottom: 5px; text-shadow: 0 0 10px #FFE81F; }
+    
+    .input-name { 
+        padding: 10px; font-size: 18px; border-radius: 5px; 
+        border: 2px solid #FFE81F; text-align: center; margin-bottom: 10px; 
+        width: 70%; background: #000; color: #FFE81F; 
+    }
+    .select-diff {
+        padding: 10px; font-size: 18px; border-radius: 5px;
+        border: 2px solid #FFE81F; text-align: center; margin-bottom: 20px;
+        width: 76%; background: #000; color: #FFE81F; font-family: 'Impact';
+    }
+    .btn-start { 
+        background: #FFE81F; color: black; font-size: 24px; padding: 15px 40px; 
+        border: none; font-weight: bold; box-shadow: 0 0 15px #FFE81F;
+    }
+  </style>
+</head>
+<body>
+  <div class="stars"></div>
+
+  <div id="startScreen">
+    <h1>STAR WARS<br><span style="font-size:18px">GUERRA NAS ESTRELAS</span></h1>
+    <div style="color:white; margin-bottom:10px;">RECORDE DA MISSÃO: <br><span id="homeRecordName" style="color:#FFE81F">...</span> - <span id="homeRecordVal">0</span></div>
+    
+    <input type="text" id="playerName" class="input-name" placeholder="NOME DO JEDI" maxlength="10">
+    
+    <select id="diffLevel" class="select-diff">
+        <option value="0">PADAWAN (FACIL)</option>
+        <option value="1" selected>JEDI (MEDIO)</option>
+        <option value="2">MESTRE (DIFICIL)</option>
+    </select>
+
+    <button class="btn btn-start" onclick="startGame()">INICIAR MISSÃO</button>
+  </div>
+
+  <div id="gameUI" style="display:none;">
+    <div class="dashboard">
+      <div class="stat-box"><span style="color:#aaa; font-size:10px;">VIDAS</span><span id="dispLives" class="lives"></span></div>
+      <div class="stat-box"><span style="color:#aaa; font-size:10px;">PONTOS</span><span id="dispScore" class="stat-val">0</span></div>
+      <div class="stat-box"><span style="color:#aaa; font-size:10px;">NIVEL</span><span id="dispLevel" class="stat-val" style="color:#00ffff">1</span></div>
+    </div>
+
+    <div style="padding-top: 15px;">
+      <button id="specialBtn" class="btn" onclick="fireSpecial()">A FORÇA (0/10)</button>
+      <button class="btn btn-red" onclick="shoot('red')">SITH (RED)</button>
+      <button class="btn btn-green" onclick="shoot('green')">YODA (GREEN)</button>
+      <button class="btn btn-blue" onclick="shoot('blue')">OBI-WAN (BLUE)</button>
+      <br>
+      <button class="btn" style="background:#333; color:#fff; border-color:#555; width:50%; font-size:16px; padding:15px; margin-top:10px;" onclick="stopGame()">MENU</button>
+    </div>
+  </div>
+
+<script>
+  let gameInterval;
+  
+  function startGame() {
+    var name = document.getElementById("playerName").value || "Jedi";
+    var diff = document.getElementById("diffLevel").value;
+    document.getElementById('startScreen').style.display = 'none';
+    document.getElementById('gameUI').style.display = 'block';
+    
+    // Envia nome e dificuldade
+    fetch('/start?name=' + encodeURIComponent(name) + '&diff=' + diff);
+    gameInterval = setInterval(updateStatus, 250);
+  }
+
+  function stopGame() {
+    fetch('/stop');
+    clearInterval(gameInterval);
+    document.getElementById('startScreen').style.display = 'flex';
+    document.getElementById('gameUI').style.display = 'none';
+  }
+
+  function shoot(c) {
+    if(navigator.vibrate) navigator.vibrate(40);
+    fetch('/shoot?color=' + c);
+  }
+
+  function fireSpecial() {
+     let btn = document.getElementById("specialBtn");
+     if(btn.classList.contains("ready")) {
+        fetch('/special');
+        btn.classList.remove("ready");
+        btn.innerHTML = "USANDO A FORÇA!";
+     }
+  }
+
+  function updateStatus() {
+    fetch('/status').then(response => response.json()).then(data => {
+      document.getElementById("dispScore").innerText = data.score;
+      document.getElementById("dispLevel").innerText = data.level;
+      
+      let hearts = "";
+      for(let i=0; i<data.lives; i++) hearts += "&#10084; "; 
+      if(data.lives <= 0) hearts = "&#9760;"; 
+      document.getElementById("dispLives").innerHTML = hearts;
+      
+      let btn = document.getElementById("specialBtn");
+      if(data.kills >= 10) {
+          if(!btn.classList.contains("ready")) {
+             btn.classList.add("ready");
+             btn.innerHTML = "&#9733; USAR A FORÇA &#9733;";
+          }
+      } else {
+          btn.classList.remove("ready");
+          btn.innerHTML = "CARREGANDO (" + data.kills + "/10)";
+      }
+
+      // Mostra o recorde DA DIFICULDADE ATUAL sendo jogada
+      document.getElementById("homeRecordName").innerText = data.recName;
+      document.getElementById("homeRecordVal").innerText = data.recVal;
+
+      if(data.running === 0 && document.getElementById('gameUI').style.display === 'block') {
+         setTimeout(stopGame, 2000);
+      }
+    });
+  }
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ================= ROTAS =================
+void handleRoot() { server.send(200, "text/html", index_html); }
+
+void handleStart() {
+  if (server.hasArg("name")) currentPlayerName = server.arg("name");
+  else currentPlayerName = "Jedi";
+  
+  int diff = 1;
+  if (server.hasArg("diff")) diff = server.arg("diff").toInt();
+  
+  resetGame(diff); 
+  
+  gameRunning = true; 
+  playIntroRequest = true; 
+  server.send(200, "text/plain", "Go");
+}
+
+void handleShoot() {
+  if (!gameRunning) return;
+  String c = server.arg("color");
+  CRGB color = CRGB::Black;
+  if (c == "red") color = CRGB::Red;
+  else if (c == "green") color = CRGB::Green;
+  else if (c == "blue") color = CRGB::Blue;
+  if (color != CRGB::Black) spawnBullet(color, false);
+  server.send(200, "text/plain", "Ok");
+}
+
+void handleSpecial() {
+  if (gameRunning && killCounter >= 10) {
+      killCounter = 0;
+      spawnBullet(CRGB::Gold, true);
+      sfxSpecialFire();
+  }
+  server.send(200, "text/plain", "Ok");
+}
+
+void handleStop() {
+  checkHighScore(); 
+  gameRunning = false;
+  server.send(200, "text/plain", "Stopped");
+}
+
+void handleStatus() {
+  String json = "{";
+  json += "\"score\":" + String(score) + ",";
+  json += "\"lives\":" + String(currentLives) + ",";
+  json += "\"level\":" + String(level) + ",";
+  json += "\"player\":\"" + currentPlayerName + "\",";
+  // Envia o recorde do nivel que foi selecionado
+  json += "\"recVal\":" + String(highScores[gameDifficulty]) + ",";
+  json += "\"recName\":\"" + highScoreNames[gameDifficulty] + "\",";
+  json += "\"kills\":" + String(killCounter) + ",";
+  json += "\"running\":" + String(gameRunning ? 1 : 0);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Carrega Recordes
+  preferences.begin("guardian", false);
+  // Facil
+  highScores[0] = preferences.getInt("hs_score_0", 0);
+  highScoreNames[0] = preferences.getString("hs_name_0", "Ninguem");
+  // Medio
+  highScores[1] = preferences.getInt("hs_score_1", 0);
+  highScoreNames[1] = preferences.getString("hs_name_1", "Ninguem");
+  // Dificil
+  highScores[2] = preferences.getInt("hs_score_2", 0);
+  highScoreNames[2] = preferences.getString("hs_name_2", "Ninguem");
+  preferences.end();
+
+  ledcAttach(BUZZER_PIN, 2000, 8); 
+  FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS);
+  FastLED.setBrightness(BRIGHTNESS);
+  WiFi.softAP(ssid, password);
+
+  server.on("/", handleRoot);
+  server.on("/start", handleStart);
+  server.on("/stop", handleStop);
+  server.on("/shoot", handleShoot);
+  server.on("/special", handleSpecial);
+  server.on("/status", handleStatus);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+  if (gameRunning && playIntroRequest) { playImperialMarch(); playIntroRequest = false; }
+  if (gameRunning) {
+    if (millis() - lastGameLoop > gameSpeed) { updateGame(); lastGameLoop = millis(); }
+  }
+}
